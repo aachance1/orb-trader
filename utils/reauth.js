@@ -1,0 +1,110 @@
+var rh = require("./robinhood");
+var stateModule = require("./state");
+
+var pendingWorkflow = null; // stores workflow state waiting for user approval
+
+async function ensureLoggedIn() {
+  if (rh.getToken()) {
+    stateModule.logEvent("AUTH", "Already logged in");
+    return true;
+  }
+
+  var email = process.env.RH_EMAIL;
+  var password = process.env.RH_PASSWORD;
+  var mfa = process.env.RH_MFA_CODE;
+
+  stateModule.logEvent("AUTH", "Logging into Robinhood...");
+  var result = await rh.login(email, password, mfa);
+
+  if (result.ok) {
+    stateModule.logEvent("AUTH", "Login successful");
+    pendingWorkflow = null;
+    return true;
+  }
+
+  if (result.verification_workflow) {
+    stateModule.logEvent("AUTH", "Robinhood verification required — checking for challenge...");
+    try {
+      var challenge = await rh.handleVerificationWorkflow(result.device_token, result.workflow_id);
+      pendingWorkflow = {
+        challenge_id: challenge.challenge_id,
+        challenge_type: challenge.challenge_type,
+        machine_id: challenge.machine_id,
+        device_token: result.device_token,
+        workflow_id: result.workflow_id,
+        email: email,
+        password: password
+      };
+
+      if (challenge.challenge_type === "prompt") {
+        stateModule.logEvent("AUTH", "Push notification sent to Robinhood app — tap Approve on your phone");
+        // Wait for push approval
+        var approved = await rh.waitForPushApproval(challenge.challenge_id);
+        if (approved) {
+          await rh.completeWorkflow(challenge.machine_id);
+          var retry = await rh.login(email, password, mfa);
+          if (retry.ok) {
+            stateModule.logEvent("AUTH", "Login successful after push approval");
+            pendingWorkflow = null;
+            return true;
+          }
+        }
+      } else if (challenge.challenge_type === "sms" || challenge.challenge_type === "email") {
+        stateModule.logEvent("AUTH_CHALLENGE", "SMS/email code required — enter it in the dashboard Reconnect flow");
+      }
+    } catch(err) {
+      stateModule.logEvent("AUTH_ERROR", "Verification failed: " + err.message);
+    }
+    return false;
+  }
+
+  if (result.mfa_required) {
+    stateModule.logEvent("AUTH_ERROR", "MFA required — add RH_MFA_CODE to Railway variables");
+    return false;
+  }
+
+  stateModule.logEvent("AUTH_ERROR", "Login failed: " + result.error);
+  return false;
+}
+
+async function submitSmsCode(code) {
+  if (!pendingWorkflow) return { ok: false, error: "No pending verification" };
+  try {
+    await rh.respondToSmsChallenge(pendingWorkflow.challenge_id, code);
+    await rh.completeWorkflow(pendingWorkflow.machine_id);
+    var retry = await rh.login(pendingWorkflow.email, pendingWorkflow.password);
+    if (retry.ok) {
+      stateModule.logEvent("AUTH", "Login successful after SMS code");
+      pendingWorkflow = null;
+      return { ok: true };
+    }
+    return { ok: false, error: "Login failed after SMS code" };
+  } catch(err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+function getPendingWorkflow() { return pendingWorkflow; }
+
+function scheduleDailyReauth() {
+  stateModule.logEvent("AUTH", "Daily reauth scheduler started");
+  function msUntilNext9amET() {
+    var now = new Date();
+    var target = new Date();
+    target.setUTCHours(13, 0, 0, 0);
+    if (target <= now) target.setUTCDate(target.getUTCDate() + 1);
+    return target - now;
+  }
+  function scheduleNext() {
+    var delay = msUntilNext9amET();
+    stateModule.logEvent("AUTH", "Next reauth in " + Math.round(delay / 60000) + " min");
+    setTimeout(async function() {
+      rh.setToken(null); // force fresh login
+      await ensureLoggedIn();
+      scheduleNext();
+    }, delay);
+  }
+  scheduleNext();
+}
+
+module.exports = { ensureLoggedIn, submitSmsCode, getPendingWorkflow, scheduleDailyReauth };
