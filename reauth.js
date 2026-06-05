@@ -1,67 +1,90 @@
+var rh = require("./robinhood");
 var stateModule = require("./state");
-var MCP_URL = "https://mcp.trayd.ai/mcp";
 
-function getCreds() {
-  var email = process.env.RH_EMAIL;
-  var password = process.env.RH_PASSWORD;
-  if (!email || !password) throw new Error("RH_EMAIL and RH_PASSWORD env vars must be set");
-  return { email: email, password: password };
-}
-
-async function callTrayd(message) {
-  var res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      messages: [{ role: "user", content: message }],
-      mcp_servers: [{ type: "url", url: MCP_URL, name: "trayd" }]
-    })
-  });
-  var data = await res.json();
-  var block = data.content && data.content.find(function(b) { return b.type === "mcp_tool_result"; });
-  if (block && block.content && block.content[0] && block.content[0].text) {
-    try { return JSON.parse(block.content[0].text); } catch(e) { return { raw: block.content[0].text }; }
-  }
-  return { message: "no result" };
-}
+var pendingWorkflow = null; // stores workflow state waiting for user approval
 
 async function ensureLoggedIn() {
-  try {
-    var status = await callTrayd("Check Robinhood login status using check_login_status.");
-    if (status && (status.logged_in === true || status.status === "logged_in")) {
-      stateModule.logEvent("AUTH", "Robinhood session active");
-      return true;
+  if (rh.getToken()) {
+    stateModule.logEvent("AUTH", "Already logged in");
+    return true;
+  }
+
+  var email = process.env.RH_EMAIL;
+  var password = process.env.RH_PASSWORD;
+  var mfa = process.env.RH_MFA_CODE;
+
+  stateModule.logEvent("AUTH", "Logging into Robinhood...");
+  var result = await rh.login(email, password, mfa);
+
+  if (result.ok) {
+    stateModule.logEvent("AUTH", "Login successful");
+    pendingWorkflow = null;
+    return true;
+  }
+
+  if (result.verification_workflow) {
+    stateModule.logEvent("AUTH", "Robinhood verification required — checking for challenge...");
+    try {
+      var challenge = await rh.handleVerificationWorkflow(result.device_token, result.workflow_id);
+      pendingWorkflow = {
+        challenge_id: challenge.challenge_id,
+        challenge_type: challenge.challenge_type,
+        machine_id: challenge.machine_id,
+        device_token: result.device_token,
+        workflow_id: result.workflow_id,
+        email: email,
+        password: password
+      };
+
+      if (challenge.challenge_type === "prompt") {
+        stateModule.logEvent("AUTH", "Push notification sent to Robinhood app — tap Approve on your phone");
+        // Wait for push approval
+        var approved = await rh.waitForPushApproval(challenge.challenge_id);
+        if (approved) {
+          await rh.completeWorkflow(challenge.machine_id);
+          var retry = await rh.login(email, password, mfa);
+          if (retry.ok) {
+            stateModule.logEvent("AUTH", "Login successful after push approval");
+            pendingWorkflow = null;
+            return true;
+          }
+        }
+      } else if (challenge.challenge_type === "sms" || challenge.challenge_type === "email") {
+        stateModule.logEvent("AUTH_CHALLENGE", "SMS/email code required — enter it in the dashboard Reconnect flow");
+      }
+    } catch(err) {
+      stateModule.logEvent("AUTH_ERROR", "Verification failed: " + err.message);
     }
-    return await linkRobinhood();
-  } catch(err) {
-    stateModule.logEvent("AUTH_ERROR", err.message);
     return false;
+  }
+
+  if (result.mfa_required) {
+    stateModule.logEvent("AUTH_ERROR", "MFA required — add RH_MFA_CODE to Railway variables");
+    return false;
+  }
+
+  stateModule.logEvent("AUTH_ERROR", "Login failed: " + result.error);
+  return false;
+}
+
+async function submitSmsCode(code) {
+  if (!pendingWorkflow) return { ok: false, error: "No pending verification" };
+  try {
+    await rh.respondToSmsChallenge(pendingWorkflow.challenge_id, code);
+    await rh.completeWorkflow(pendingWorkflow.machine_id);
+    var retry = await rh.login(pendingWorkflow.email, pendingWorkflow.password);
+    if (retry.ok) {
+      stateModule.logEvent("AUTH", "Login successful after SMS code");
+      pendingWorkflow = null;
+      return { ok: true };
+    }
+    return { ok: false, error: "Login failed after SMS code" };
+  } catch(err) {
+    return { ok: false, error: err.message };
   }
 }
 
-async function linkRobinhood() {
-  var creds = getCreds();
-  stateModule.logEvent("AUTH", "Re-linking Robinhood...");
-  try {
-    var link = await callTrayd('Link Robinhood using link_robinhood with email="' + creds.email + '" and password="' + creds.password + '".');
-    if (link && link.status === "awaiting_approval") {
-      stateModule.logEvent("AUTH", "Phone notification sent, waiting 20s...");
-      await new Promise(function(r) { setTimeout(r, 20000); });
-      var complete = await callTrayd('Complete link using complete_robinhood_link with email="' + creds.email + '" and password="' + creds.password + '".');
-      if (complete && complete.status === "logged_in") {
-        stateModule.logEvent("AUTH", "Re-link successful");
-        return true;
-      }
-    }
-    stateModule.logEvent("AUTH_ERROR", "Re-link failed: " + JSON.stringify(link));
-    return false;
-  } catch(err) {
-    stateModule.logEvent("AUTH_ERROR", err.message);
-    return false;
-  }
-}
+function getPendingWorkflow() { return pendingWorkflow; }
 
 function scheduleDailyReauth() {
   stateModule.logEvent("AUTH", "Daily reauth scheduler started");
@@ -76,6 +99,7 @@ function scheduleDailyReauth() {
     var delay = msUntilNext9amET();
     stateModule.logEvent("AUTH", "Next reauth in " + Math.round(delay / 60000) + " min");
     setTimeout(async function() {
+      rh.setToken(null); // force fresh login
       await ensureLoggedIn();
       scheduleNext();
     }, delay);
@@ -83,7 +107,4 @@ function scheduleDailyReauth() {
   scheduleNext();
 }
 
-module.exports = {
-  ensureLoggedIn: ensureLoggedIn,
-  scheduleDailyReauth: scheduleDailyReauth
-};
+module.exports = { ensureLoggedIn, submitSmsCode, getPendingWorkflow, scheduleDailyReauth };
